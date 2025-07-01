@@ -23,21 +23,28 @@ class MediaController:
         self.repeat_mode = False
         self.shuffle_mode = False
         self.last_position = 0
+        self.playback_start_time = 0
+        self.paused_time = 0
         self.config_file = os.path.expanduser("~/.termux_media_controller_config.json")
 
         self.load_config()
 
-    def _run_termux_command(self, command):
+    def _run_termux_command(self, command, timeout=5, blocking=True):
         try:
-            result = subprocess.run(command, capture_output=True, text=True, check=True)
-            return result.stdout.strip()
-        except subprocess.CalledProcessError as e:
-            print(f"Error executing command: {' '.join(command)}")
-            print(f"Stdout: {e.stdout}")
-            print(f"Stderr: {e.stderr}")
+            if blocking:
+                result = subprocess.run(command, capture_output=True, text=True, check=False, timeout=timeout)
+                return result.stdout.strip()
+            else:
+                # For non-blocking commands (like play, pause, stop), just start the process
+                subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return ""
+        except subprocess.TimeoutExpired:
             return None
         except FileNotFoundError:
             print(f"Command not found. Make sure '{command[0]}' is installed and in your PATH.")
+            return None
+        except Exception as e:
+            print(f"An unexpected error occurred while running command {' '.join(command)}: {e}")
             return None
 
     def play(self, file_path=None):
@@ -56,23 +63,27 @@ class MediaController:
             return
 
         print(f"Playing: {self.current_file}")
-        self._run_termux_command(["termux-media-player", "play", self.current_file])
+        self._run_termux_command(["termux-media-player", "play", self.current_file], blocking=False)
         self.is_playing = True
+        self.playback_start_time = time.time() - self.last_position # Account for resuming
         self.load_metadata()
         self.send_notification(f"Playing: {self.metadata.get('artist', 'Unknown')} - {self.metadata.get('title', 'Unknown')}")
         self.save_config()
 
     def pause(self):
         if self.is_playing:
-            self._run_termux_command(["termux-media-player", "pause"])
+            self._run_termux_command(["termux-media-player", "pause"], blocking=False)
             self.is_playing = False
+            self.paused_time = time.time()
+            self.last_position += (self.paused_time - self.playback_start_time)
             self.send_notification("Paused")
             self.save_config()
 
     def stop(self):
         if self.is_playing:
-            self._run_termux_command(["termux-media-player", "stop"])
+            self._run_termux_command(["termux-media-player", "stop"], blocking=False)
             self.is_playing = False
+            self.last_position = 0  # Reset position on stop
             self.send_notification("Stopped")
             self.save_config()
 
@@ -128,32 +139,19 @@ class MediaController:
             }
 
     def get_playback_info(self):
-        info = self._run_termux_command(["termux-media-player", "info"])
-        if info:
-            # Parse info to get position and state
-            # Example info: "Playing: /path/to/song.mp3 (0:15/3:45)" or "Paused: /path/to/song.mp3 (0:15/3:45)"
-            parts = info.split()
-            if len(parts) >= 3:
-                state = parts[0].replace(":", "")
-                time_str = parts[-1].strip("()")
-                current_time_str, total_time_str = time_str.split('/')
-                
-                def parse_time(time_str):
-                    mins, secs = map(int, time_str.split(':'))
-                    return mins * 60 + secs
+        current_seconds = self.last_position
+        total_seconds = self.metadata.get('duration', 0)
 
-                current_seconds = parse_time(current_time_str)
-                total_seconds = parse_time(total_time_str)
-                
-                self.is_playing = (state == "Playing")
-                self.last_position = current_seconds
-                self.metadata['duration'] = total_seconds
-                return current_seconds, total_seconds
-        return 0, self.metadata.get('duration', 0)
+        if self.is_playing:
+            current_seconds = self.last_position + (time.time() - self.playback_start_time)
+            if current_seconds > total_seconds and total_seconds > 0:
+                current_seconds = total_seconds # Cap at total duration
+
+        return current_seconds, total_seconds
 
     def set_volume(self, level):
         self.volume = max(0, min(100, level))
-        self._run_termux_command(["termux-volume", "music", str(self.volume)])
+        self._run_termux_command(["termux-volume", "music", str(self.volume)], blocking=False)
         self.save_config()
 
     def get_lyrics(self, artist, title):
@@ -277,20 +275,23 @@ class MediaController:
     def resume_playback(self):
         if self.current_file and os.path.exists(self.current_file):
             print(f"Resuming playback of {self.current_file} from {self.last_position} seconds.")
-            # termux-media-player doesn't directly support seeking to a position on play
-            # This would require a more advanced media player or a loop to skip
-            # For now, just play the file.
-            self.play(self.current_file)
+            self._run_termux_command(["termux-media-player", "play", self.current_file])
+            self.is_playing = True
+            self.playback_start_time = time.time() - self.last_position
+            self.load_metadata()
+            self.send_notification(f"Playing: {self.metadata.get('artist', 'Unknown')} - {self.metadata.get('title', 'Unknown')}")
+            self.save_config()
         else:
             print("No previous session to resume.")
 
     def send_notification(self, message):
-        self._run_termux_command(["termux-notification", "--content", message])
+        self._run_termux_command(["termux-notification", "--content", message], blocking=False)
 
     def curses_ui(self, stdscr):
         curses.curs_set(0)  # Hide cursor
         stdscr.nodelay(True) # Non-blocking input
         stdscr.timeout(100) # Refresh every 100ms
+        stdscr.keypad(True) # Enable interpretation of special keys
 
         lyrics_lines = []
         lyrics_scroll_pos = 0
@@ -301,6 +302,9 @@ class MediaController:
 
             # Handle input
             key = stdscr.getch()
+            if key == curses.ERR:
+                key = -1 # No key pressed
+
             if key == ord('q'):
                 break
             elif key == ord(' '):
